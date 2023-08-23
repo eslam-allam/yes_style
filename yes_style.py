@@ -21,6 +21,7 @@ from tqdm import tqdm
 import time
 import re
 from langdetect import DetectorFactory, detect
+from enum import Enum
 
 DetectorFactory.seed = 0
 
@@ -70,6 +71,10 @@ class ProductType:
     MULTI_COLOR = 'multi-color'
     MULTI_SHADE = 'multi-shade'
     MULTI_OPTION = 'multi-option'
+
+class MediaType(Enum):
+    IMAGE = 'image'
+    VIDEO = 'video'
 
 def safe_get_element(wd: webdriver.WebDriver, by: By, value:str):
     """get element from DOM without throwing exceptions if not present
@@ -156,6 +161,14 @@ def change_country_and_currency(wd: webdriver.WebDriver, currency = 'EUR - Euro 
         return True
     except Exception:
         logger.fatal('An unexpected error occurred while changing currency.', exc_info=True)
+        return False
+    
+def click_element(wd: webdriver.WebDriver, element: WebElement):
+    try:
+        wd.execute_script(JAVASCRIPT_EXECUTE_CLICK, element)
+        return True
+    except Exception:
+        logger.error('Failed to click element...')
         return False
 
 def click_element_refresh_stale(wd: webdriver.WebDriver, element: WebElement, by: By, locator: str, index = None):
@@ -250,27 +263,37 @@ def get_attribute_retry_stale(wd: webdriver.WebDriver, element: WebElement ,attr
                     stale_counter += 1
     return result
 
-def get_variation_images(wd: webdriver.WebDriver, variation_details:dict[str, object]):
-    """get carousel images for sub variant
+def get_gallery_media(wd: webdriver.WebDriver, product_details: dict[str, object], media_type = MediaType.IMAGE):
+    if media_type == MediaType.IMAGE:
+        gallery_button_selector = '//button[contains(@class,"productDetailPage_md-button__5P_hJ") and not(span[@class="icon icon-video"])]'
+        gallery_media_selector = '.productMedia_img-content__bBpAS > img'
+    elif media_type == MediaType.VIDEO:
+        gallery_button_selector = '//button[contains(@class,"productDetailPage_md-button__5P_hJ") and span[@class="icon icon-video"]]'
+        gallery_media_selector = '.productMedia_video-container__S0RY3 > iframe'
+    else:
+        logger.error(f"Invalid media type: '{media_type}'")
+        return product_details
 
-    Args:
-        wd (webdriver.WebDriver): the driver to be used by this operation
-        variation_details (dict[str, object]): the variant to be updated
+    gallery_button = wait_for_presence_get(wd, By.XPATH, gallery_button_selector, must_be_visible=True)
+    if gallery_button is None:
+        logger.warning(f'Unable to find gallery {media_type} for URL: "{product_details["product_url"]}"')
+        return product_details
+    
+    if not click_element(wd, gallery_button):
+        logger.error(f"Failed to open gallery for product URL: \"{product_details['product_url']}\"")
+        return product_details
+    gallery_images: list[WebElement] = wait_for_presence_get(wd, By.CSS_SELECTOR, gallery_media_selector, multiple=True)
+    for i, image in enumerate(gallery_images):
+        product_details[f'product_{media_type.value}_{i + 2}'] = image.get_attribute('src')
+    close_button = wait_for_presence_get(wd, By.CSS_SELECTOR, '.productMedia_closeButton__uo6Nf', must_be_visible=True)
+    if not click_element(wd, close_button):
+        logger.error(f"Failed to close gallery view for URL: \"{product_details['product_url']}\"")
+    return product_details
 
-    Returns:
-        dict[str, object]: the updated product
-    """
-    right_arrow = wd.find_element(By.CLASS_NAME, 'athenaProductImageCarousel_rightArrow')
-    for i, image in enumerate(wd.find_elements(By.CLASS_NAME, 'athenaProductImageCarousel_image')):
-        if i != 0:
-            right_arrow = click_element_refresh_stale(wd, right_arrow, By.CLASS_NAME, 'athenaProductImageCarousel_rightArrow')
-        image_src = get_attribute_retry_stale(wd, image, 'src', variation_details, By.CLASS_NAME
-                                                           , 'athenaProductImageCarousel_image', i, 'image')
-        if image_src is None:
-            break
-        column_name = f'product_image_{i+1}'
-        variation_details[column_name] = image_src
-    return variation_details
+def get_cover_image(wd: webdriver.WebDriver, product_details: dict[str, object]):
+    cover_image: WebElement = wait_for_presence_get(wd, By.CSS_SELECTOR, '.productDetailPage_productImageCover__chqZe > img')
+    product_details['product_image_1'] = cover_image.get_attribute('src')
+    return product_details
 
 def wait_for_presence_get(wd: webdriver.WebDriver, by: By, value: str, wait_for: int = 2, must_be_visible = False, multiple = False):
     """wait for presence of element before fetching from DOM
@@ -296,19 +319,17 @@ def wait_for_presence_get(wd: webdriver.WebDriver, by: By, value: str, wait_for:
         return wd.find_element(by, value)
     return wd.find_elements(by, value)
 
-def get_variation_misc_details(wd: webdriver.WebDriver, variation_details:dict[str, object], product_id: str, force_out_of_stock = False):
+def get_variation_misc_details(wd: webdriver.WebDriver, variation_details:dict[str, object]):
     """get a variety of miscellaneous details for a given sub variant 
 
     Args:
         wd (webdriver.WebDriver): the driver to be used by this operation
         variation_details (dict[str, object]): the sub variant to be updated
-        product_id (str): unique identifier for the sub variant
-        force_out_of_stock (bool, optional): set the product as out of stock regardless of the test outcome. Defaults to False.
 
     Returns:
         dict[str, object]: the updated sub variant
     """
-    
+    fdsf,,
     variation_details['variant_SKU'] = product_id
     product_name = wait_for_presence_get(wd, By.CLASS_NAME, 'productName_title')
     variation_details['product_name'] = get_attribute_retry_stale(wd, product_name, 'textContent', variation_details
@@ -345,66 +366,22 @@ def get_variation_misc_details(wd: webdriver.WebDriver, variation_details:dict[s
             variation_details['in_stock'] = 'yes'
     return variation_details
 
-def get_multi_size_details(wd: webdriver.WebDriver, product_details: dict[str, object]) -> list[dict[str, object]]:
-    """get sub variants of multi size product
 
-    Args:
-        wd (webdriver.WebDriver): the driver to be used by this operation
-        product_details (dict[str, object]): the parent product
-
-    Returns:
-        list[dict[str, object]]: details of sub variants of parent product
-    """
-    variations = []
-    buttons = wd.find_elements(By.CLASS_NAME, 'athenaProductVariations_box')
-    for i, button in enumerate(buttons):
-        restart = True
-        restart_counter = 0
-        while restart:
-            button = wd.find_elements(By.CLASS_NAME, 'athenaProductVariations_box')[i]
-            variation_details = product_details.copy()
-            is_selected = safe_get_element(button, By.CLASS_NAME, 'srf-hide')
-            if is_selected is None:
-                old_price = get_old_price(wd)
-                wd.execute_script(JAVASCRIPT_EXECUTE_CLICK, button)
-                try:
-                    WebDriverWait(wd, 10).until(EC.staleness_of(old_price))
-                except Exception:
-                    logger.warning(f'Could not find old price for url: "{product_details["product_url"]}"')
-                button = wd.find_elements(By.CLASS_NAME, 'athenaProductVariations_box')[i]
-            variation_details['size'] = button.text
-            variation_details = get_variation_images(wd, variation_details)
-            if not variation_details.get('product_image_1', False):
-                logger.error(f'Could not find primary image from URL: "{variation_details["product_url"]}". Size: "{variation_details["size"]}"')
-                continue
-            if any([x.get('product_image_1', '') == variation_details['product_image_1'] for x in variations]):
-                logger.warning('Variation image %d in URL: "%s", variation: "%s" is duplicated. Retrying fetch...', 
-                            i, variation_details['product_url'], get_variation_name(variation_details))
-                restart_counter += 1
-                if restart_counter > MAX_RETRY_VARIATION:
-                    logger.warning(f'Max fetch retry reached for URL: "{variation_details["product_url"]}, variation: {get_variation_name(variation_details)}". Skipping variation...')
-                    restart = False
-                continue
-            
-            restart = False
-            product_id = get_value_from_base_name(variation_details['product_image_1'])
-            variation_details = get_variation_misc_details(wd, variation_details, product_id)
-            variations.append(variation_details)
-    return variations
-
-def get_value_from_base_name(url:str, first_splitter = '.', second_splitter = '-'):
+def get_value_from_base_name(url:str, first_splitter = '.', first_index = 0, second_splitter = '-', second_index = 0):
     """get a value from the base name of a url after splitting twice
 
     Args:
         url (str): the url to get the value from
         first_splitter (str, optional): first character to split on. Defaults to '.'.
+        first_index (int, optional): index of element to select after first split. Defaults to 0.
         second_splitter (str, optional): second character to split on. Defaults to '-'.
+        second_index (int, optional): index of element to select after second split. Defaults to 0.
 
     Returns:
         _type_: _description_
     """
     base_name = os.path.basename(urlsplit(url).path)
-    return base_name.split(first_splitter)[0].split(second_splitter)[0].strip()
+    return base_name.split(first_splitter)[first_index].split(second_splitter)[second_index].strip()
 
 def get_old_price(wd: webdriver.WebDriver):
     """Get price of product when you reach the page before clicking on sub variants
@@ -431,8 +408,18 @@ def rgb_to_hex(rgb: list):
     """
     return '#%02x%02x%02x' % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
-def get_multi_color_shade_option_details(wd: webdriver.WebDriver, product_details: dict[str, object], product_type: str) -> list[dict[str, object]]:
-    """get sub variants of multi color/shade/option product
+def get_detail_container_with_text(wd: webdriver.WebDriver, text: str, contains = False):
+    if contains:
+        selector = f'contains(text(), "{text}")'
+    else:
+        selector = f'text()="{text}"'
+    return wait_for_presence_get(wd, By.XPATH, f'//div[contains(@class, "accordion_accordion__vzKcR productDetailPage_productInfoBox__1cs9X productDetailPage_accordionContainer__YBTTO") and h4[{selector}]]')
+
+# TODO: create get section and get table functions to be used with this function to get variant_SKU and other details
+# use this "//section[h5[text()="Product Information"]]/table//tr[td[contains(text(), "Catalog No")]]/td[2]"
+
+def get_multi_option_details(wd: webdriver.WebDriver, product_details: dict[str, object], variation_button: WebElement) -> list[dict[str, object]]:
+    """get sub variants of multi option product
 
     Args:
         wd (webdriver.WebDriver): the chrome webdriver to be used for this operation
@@ -447,56 +434,39 @@ def get_multi_color_shade_option_details(wd: webdriver.WebDriver, product_detail
     """
     
     variations = []
-    drop_down_list = wd.find_element(By.CLASS_NAME, 'athenaProductVariations_dropdown')
-    select = Select(drop_down_list)
+    if not click_element(wd, variation_button):
+        logger.error(f'Failed to click variations drop down for URL: "{product_details["product_url"]}"')
+        return variations
+    options: list[WebElement] = wait_for_presence_get(wd, By.CSS_SELECTOR, 
+        'div.MuiDialogContent-root.productOptions_dialogContent__iyVXZ.mui-style-16aze95 > button.MuiButtonBase-root.MuiButton-root.MuiButton-text.MuiButton-textPrimary.MuiButton-sizeMedium.MuiButton-textSizeMedium'
+        , must_be_visible=True, multiple=True)
     i = 0
-    for option, id in [(x.text, x.get_attribute('value')) for x in select.options if x.text.casefold() != 'Please choose...'.casefold()]:
-        restart = True
-        restart_counter = 0
-        while restart:
-            variation_details = product_details.copy()
-            old_price = get_old_price(wd)
-            select = Select(wd.find_element(By.CLASS_NAME, 'athenaProductVariations_dropdown'))
-            select.select_by_visible_text(option)
-            try:
-                WebDriverWait(wd, 10).until(EC.staleness_of(old_price))
-            except Exception:
-                logger.debug(f'Could not find old price for url: "{product_details["product_url"]}", for value')
-            if product_type == ProductType.MULTI_COLOR:
-                variation_type = 'color'
-            elif product_type == ProductType.MULTI_SHADE:
-                variation_type = 'shade'
-            elif product_type == ProductType.MULTI_OPTION:
-                variation_type = 'option'
-            else:
-                raise ValueError(f'Invalid product type: {product_type}')
-            force_out_of_stock = False
-            if option.endswith('- Out of stock'):
-                force_out_of_stock = True
-            variation_details[variation_type] = option.removesuffix('- Out of stock').strip()
-            variation_details = get_variation_images(wd, variation_details)
-            if not variation_details.get('product_image_1', False):
-                logger.error(f'Could not find primary image from URL: "{variation_details["product_url"]}". Size: "{variation_details["size"]}"')
-                continue
-            if any([x.get('product_image_1', '') == variation_details['product_image_1'] for x in variations]):
-                logger.warning('Variation image %d in URL: "%s", variation: "%s" is duplicated. Retrying fetch...', 
-                            i, variation_details['product_url'], get_variation_name(variation_details))
-                restart_counter += 1
-                if restart_counter > MAX_RETRY_VARIATION:
-                    logger.warning(f'Max fetch retry reached for URL: "{variation_details["product_url"]}, variation: {get_variation_name(variation_details)}". Skipping variation...')
-                    restart = False
-                continue
-                
-            restart = False
-            product_id = get_value_from_base_name(variation_details['product_image_1'])
-            variation_details = get_variation_misc_details(wd, variation_details, product_id, force_out_of_stock)
+    for option in options:
+        variation_details = product_details.copy()
 
-            if product_type != ProductType.MULTI_OPTION:
-                color = wd.find_element(By.CSS_SELECTOR, f"span[data-value-id='{id}']").value_of_css_property('background-color')
-                color = Color.from_string(color).hex
-                variation_details[f'{variation_type}_hex'] = color
-            variations.append(variation_details)
-        i += 1
+        variation_details['option'] = option.find_element(By.CLASS_NAME, 'productOptions_infoCol__kazld').text
+        in_stock = option.get_attribute("aria-disabled") == 'false'
+        variation_details['in_stock'] = in_stock
+        
+        if in_stock:
+            variation_details['price'] = option.find_element(By.CLASS_NAME, 'productOptions_priceCol__pO6IU').text.split(" ")[1]
+        else:
+            variation_details['price'] = None
+        
+        close_button = wait_for_presence_get(wd, By.CSS_SELECTOR, '.dialog_closeButton__NtkVk', must_be_visible=True)
+        if not click_element(wd, close_button):
+            logger.error(f'Could not close options menu for URL: "{variation_details["product_url"]}", option: "{variation_details["option"]}"')
+            return variations
+        
+        variation_details = get_cover_image(wd, variation_details)
+
+        if not variation_details.get('product_image_1', False):
+            logger.error(f'Could not find primary image from URL: "{variation_details["product_url"]}". Size: "{variation_details["size"]}"')
+            continue
+
+        variation_details = get_variation_misc_details(wd, variation_details)
+        variations.append(variation_details)
+        
     return variations
 
 def create_serialized_sku(group:pd.Series, mask):
@@ -519,7 +489,7 @@ def create_serialized_sku(group:pd.Series, mask):
             count += 1
     return pd.Series(serialized_skus, index=group.index)
 
-def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: dict[str, object], url: str):
+def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: dict[str, object]):
     """get sub variants of product based on it's type
 
     Args:
@@ -530,24 +500,12 @@ def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: d
     Returns:
         list[dict[str, object]]: list of sub variants of parent product
     """
-    variation_label = safe_get_element(wd, By.CLASS_NAME, 'athenaProductVariations_dropdownLabel')
+    variable_button = wait_for_presence_get(wd, By.CSS_SELECTOR, 'div.buyOptions_roundCornerSelect__LTxbf buyOptions_standalone__Fk4Ka[aria-hidden="true"]', must_be_visible=True)
     product_variations = []
-    if variation_label is not None:
-        variation = variation_label.text.strip()
-        if variation.replace(' ', '').casefold() in color_variation_tags:
-            product_details['product_type'] = ProductType.MULTI_COLOR
-            product_variations = get_multi_color_shade_option_details(wd, product_details, ProductType.MULTI_COLOR)
-        elif variation.replace(' ', '').casefold() in shade_variation_tags:
-            product_details['product_type'] = ProductType.MULTI_SHADE
-            product_variations = get_multi_color_shade_option_details(wd, product_details, ProductType.MULTI_SHADE)
-        elif variation.replace(' ', '').casefold() in size_variation_tags:
-            product_details['product_type'] = ProductType.MULTI_SIZE
-            product_variations = get_multi_size_details(wd, product_details)
-        elif variation.replace(' ', '').casefold() in option_variation_tags:
-            product_details['product_type'] = ProductType.MULTI_OPTION
-            product_variations = get_multi_color_shade_option_details(wd, product_details, ProductType.MULTI_OPTION)
-        else:
-            logger.error(f'Unknown variant type: "{variation}". URL: {url}')
+    if variable_button is not None:
+        product_details['product_type'] = ProductType.MULTI_OPTION
+        product_variations = get_multi_option_details(wd, product_details, ProductType.MULTI_OPTION)
+        
     else:
         product_details['product_type'] = ProductType.SINGLE
         product_details = get_variation_images(wd, product_details)
@@ -623,15 +581,16 @@ def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], product_cate
                 continue
             product_details['brand_name'] = brand_name.text
 
-            primary_sku = wait_for_presence_get(wd, By.CLASS_NAME, 'athenaProductImageCarousel_image')
-            primary_sku = get_attribute_retry_stale(wd, primary_sku, 'src', product_details, By.CLASS_NAME, 'athenaProductImageCarousel_image',
-                                                    label = 'Primary SKU')
-            if primary_sku is None:
+            primary_sku = get_value_from_base_name(url, first_index=1, second_splitter=None)
+            if not primary_sku.isnumeric():
                 logger.error('Could not find primary SKU for URL: "%s". Skipping...', url)
                 continue
-            product_details['primary_SKU'] = get_value_from_base_name(primary_sku)
-            product_details = get_product_descriptions(wd, product_details)
-            product_variations = get_product_variations_from_type(wd, product_details, url)
+            product_details['primary_SKU'] = primary_sku
+
+            product_details = get_gallery_media(wd, product_details, MediaType.IMAGE)
+            product_details = get_gallery_media(wd, product_details, MediaType.VIDEO)
+
+            product_variations = get_product_variations_from_type(wd, product_details)
             df = pd.concat([df, pd.DataFrame(product_variations)], ignore_index=True)
             time.sleep(ACTION_DELAY_SEC)
         except Exception:
