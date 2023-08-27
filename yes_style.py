@@ -31,7 +31,7 @@ from urllib3.exceptions import ConnectionError
 
 DetectorFactory.seed = 0
 
-LOGGING_LEVEL = logging.DEBUG
+LOGGING_LEVEL = logging.INFO
 LOGGING_FOLDER = './scraping_logs'
 LOGGING_FILE = f'{LOGGING_FOLDER}/yes_style.log'
 
@@ -665,6 +665,12 @@ def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: d
         logger.debug(f'{product_price.text=}')
         product_details['price'] = float(product_price.text.split(' ')[0].replace(',', '.'))
 
+        product_details = get_cover_image(wd, product_details)
+
+        if not product_details.get('product_image_1', False):
+            logger.error(f'Could not find primary image from URL: "{product_details["product_url"]}". Size: "{variation_details["size"]}"')
+            return []
+
         product_details = get_variation_misc_details(wd, product_details)
 
         if product_details is None:
@@ -739,7 +745,7 @@ def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], progress_bar
 
     return df
 
-def dump_page_csv(page: pd.DataFrame, category: str, page_number: int, cleanup = True):
+def dump_page_csv(page: pd.DataFrame, category: str, page_number: int, cleanup = True, notify = True):
     page_dump_folder = PAGE_DUMP_FOLDER.format(category=category)
     if not os.path.isdir(page_dump_folder):
         os.makedirs(page_dump_folder)
@@ -748,10 +754,13 @@ def dump_page_csv(page: pd.DataFrame, category: str, page_number: int, cleanup =
 
     if cleanup:
         page = cleanup_dataframe(page)
+    if notify:
+        notify_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, f'Succesfully scraped category: "{category}", page: {page_number}')
+
 
     page.to_csv(file_path, index=False)
 
-def dump_category_csv(products: pd.DataFrame, category: str, cleanup = True):
+def dump_category_csv(products: pd.DataFrame, category: str, cleanup = True, notify = True):
     category_dump_folder = CATEGORY_DUMP_FOLDER.format(category=category)
     if not os.path.isdir(category_dump_folder):
         os.makedirs(category_dump_folder)
@@ -761,6 +770,8 @@ def dump_category_csv(products: pd.DataFrame, category: str, cleanup = True):
 
     if cleanup:
         page = cleanup_dataframe(page)
+    if notify:
+        notify_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, f'Succesfully scraped full category: "{category}"')
 
     products.to_csv(file_path, index=False)
 
@@ -784,7 +795,7 @@ def scrape_category_url(url: str):
     logger.debug(f'{current_process_id=}')
 
     category_name = url.removeprefix('https://www.yesstyle.com/en/').split('/')[0].removeprefix('beauty-').replace('-', ' ')
-    worker.name = f'WORKER#{current_process_id}_{category_name}'
+    # worker.name = f'WORKER#{current_process_id}_{category_name}'
     progress_bar_position = (current_process_id) * 2
     with webdriver.WebDriver(browser_options) as wd:
         wd.get(f'{url}')
@@ -1004,7 +1015,7 @@ def cleanup_dataframe(dataframe: pd.DataFrame, in_place = False):
     df['brand_name'] = df['brand_name'].transform(capitalize_words)
 
     logger.info('Converting all lists to new-line delimited text...')
-    df = df.applymap(lambda x: '\n'.join(x) if isinstance(x, list) else x)
+    df = df.applymap(lambda x: '\n'.join([y.replace('\n', '') for y in x]) if isinstance(x, list) else x)
 
     logger.info('Stripping all strings in data-frame...')
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
@@ -1050,7 +1061,7 @@ if __name__ == '__main__':
     FINAL_DATA_FRAME_WITH_PRE_CLEANUP_PATH = f'{DUMP_FOLDER}/yes_style_pre.xlsx'
     FINAL_DATA_FRAME_WITH_POST_CLEANUP_PATH = f'{DUMP_FOLDER}/yes_style_post.xlsx'
 
-    TELEGRAM_BOT_TOKEN = '5908631649:AAF5j_gdbtw8Zza67w3jEQc8hRkgUwfvFUY'
+    TELEGRAM_BOT_TOKEN = '6537198249:AAHd_GKm9Bi74wTtl8khcRk2Nk9avkwxjWI'
     TELEGRAM_CHAT_IDS = ['5128147602']
     shutdown = False
 
@@ -1058,6 +1069,7 @@ if __name__ == '__main__':
     browser_options.add_argument('-disable-notifications')
     browser_options.add_argument('-headless')
     browser_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36")
+    browser_options.add_experimental_option("excludeSwitches", ["enable-logging"])
 
     CATEGORY_LINKS = [
                     'https://www.yesstyle.com/en/beauty-skin-care/list.html/bcc.15544_bpt.46',
