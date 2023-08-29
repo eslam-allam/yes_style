@@ -10,8 +10,8 @@ import os
 import pandas as pd
 from selenium.webdriver.support.color import Color
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, Future, CancelledError
-from threading import current_thread
+from concurrent.futures import ThreadPoolExecutor, wait, Future, CancelledError, as_completed
+from threading import current_thread, Event
 import logging
 import gzip
 import shutil
@@ -28,6 +28,7 @@ from selenium.webdriver.common.keys import Keys
 import numpy as np
 import requests
 from urllib3.exceptions import ConnectionError
+from exceptions import CaptchaEncounteredError
 
 DetectorFactory.seed = 0
 
@@ -252,7 +253,7 @@ def get_attribute_retry_stale(wd: webdriver.WebDriver, element: WebElement ,attr
             result = element.get_attribute(attribute)
             break
         except StaleElementReferenceException:
-            variation = get_variation_name(variation_details)
+            variation = variation_details.get('option', 'single')
             logger.debug(f'{label} {index + 1 if index is not None else ""} in URL: "{variation_details["product_url"]}" variation: "{variation}" is stale. Refreshing...')
             if index is None:
                 searched_element = safe_get_element(wd, by, value)
@@ -668,7 +669,7 @@ def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: d
         product_details = get_cover_image(wd, product_details)
 
         if not product_details.get('product_image_1', False):
-            logger.error(f'Could not find primary image from URL: "{product_details["product_url"]}". Size: "{variation_details["size"]}"')
+            logger.error(f'Could not find primary image from URL: "{product_details["product_url"]}". Size: "{product_details["size"]}"')
             return []
 
         product_details = get_variation_misc_details(wd, product_details)
@@ -678,7 +679,23 @@ def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: d
         product_variations = [product_details]
     return product_variations
 
-def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], progress_bar: tqdm):
+def get_categories_refresh_on_fail(wd: webdriver.WebDriver, url, max_retries = 5, sleep_time = 20):
+    retry_count = 0
+    while True:
+        wd.get(url)
+        try:
+            categories = (x.text for x in wait_for_presence_get(wd, By.CSS_SELECTOR, 
+                    'li.icon.icon-angle-right:nth-child(n+2) > a, li.breadcrumb_v-stroke__A4C9P > a', must_be_visible=True, multiple=True))
+            return categories
+        except Exception:
+            logger.warning(f"Could not find categories for URL: '{url}'. Retrying...")
+        if retry_count >= max_retries:
+            logger.error("Max reload exceeded.")
+            return []
+        retry_count += 1
+        time.sleep(sleep_time)
+
+def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], progress_bar: tqdm, shutdown:Event):
     """get product details of every url (product)
 
     Args:
@@ -690,23 +707,22 @@ def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], progress_bar
     Returns:
         pd.DataFrame: a data-frame containing all products scraped in this page
     """
-    global shutdown
     df = pd.DataFrame()
     progress_bar.total = len(urls)
     progress_bar.reset()
     progress_bar.refresh()
     for url in urls:
-        if shutdown:
-            logger.info(f'Received shutdown signal at product: "{url}". Returning...')
+        if shutdown.is_set():
+            logger.info(f"Recieved shutdown signal at URL: '{url}'")
             return df
         try:
-            wd.get(url)
             product_details = {}
             product_variations = []
             product_details['product_url'] = url
-
-            categories = (x.text for x in wait_for_presence_get(wd, By.CSS_SELECTOR, 
-                            f'li.icon.icon-angle-right:nth-child(n+{2}) > a, li.breadcrumb_v-stroke__A4C9P > a', must_be_visible=True, multiple=True))
+            categories = get_categories_refresh_on_fail(wd, url)
+            if not categories:
+                raise CaptchaEncounteredError(f"Encountered cloudflare captcha for product url: \"{url}\"")
+            
             for i, crumb in enumerate(categories):
                 product_details[f'product_category_{i + 1}'] = crumb
 
@@ -736,8 +752,9 @@ def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], progress_bar
 
             product_variations = get_product_variations_from_type(wd, product_details)
             df = pd.concat([df, pd.DataFrame(product_variations)], ignore_index=True)
-        except ConnectionError:
-            pass
+        except CaptchaEncounteredError as e:
+            notify_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, str(e))
+            return df
         except Exception:
             logger.exception(f'Unexpected error with trying to fetch data in url "{url}".', exc_info=True)
         time.sleep(ACTION_DELAY_SEC)
@@ -775,7 +792,7 @@ def dump_category_csv(products: pd.DataFrame, category: str, cleanup = True, not
 
     products.to_csv(file_path, index=False)
 
-def scrape_category_url(url: str):
+def scrape_category_url(url: str, browser_options: options.Options, shutdown: Event):
     """Scrapes every page of the given cult_beauty category url
 
     Args:
@@ -785,8 +802,6 @@ def scrape_category_url(url: str):
     Returns:
         pd.DataFrame: a data-frame containing all products scraped by the driver
     """
-    global shutdown
-    global browser_options
 
     start = time.time()
     worker = current_thread()
@@ -795,7 +810,6 @@ def scrape_category_url(url: str):
     logger.debug(f'{current_process_id=}')
 
     category_name = url.removeprefix('https://www.yesstyle.com/en/').split('/')[0].removeprefix('beauty-').replace('-', ' ')
-    # worker.name = f'WORKER#{current_process_id}_{category_name}'
     progress_bar_position = (current_process_id) * 2
     with webdriver.WebDriver(browser_options) as wd:
         wd.get(f'{url}')
@@ -821,12 +835,18 @@ def scrape_category_url(url: str):
         inner_bar = tqdm(total=0, colour='green', position=progress_bar_position + 1, desc='Products scanned', unit='Products', leave=True)
         for page in tqdm(range(1, last_page + 1), colour='red', position= progress_bar_position, desc='Pages scanned', unit='Pages', postfix = {'category': category_name}, leave=True):
             wd.get(f'{url}#/pn={page}')
-            product_links = list(set([x.get_attribute('href') for x in wait_for_presence_get(wd, By.CSS_SELECTOR, 'div.itemContainer > a', multiple=True)]))
+            while True:
+                try:
+                    product_links = list(set([x.get_attribute('href') for x in wait_for_presence_get(wd, By.CSS_SELECTOR, 'div.itemContainer > a', multiple=True)]))
+                    break
+                except StaleElementReferenceException:
+                    logger.error(f"Stale product links for category: \"{category_name}\", page: \"{page}\". Retrying...")
             logger.debug(f'Number of products on page: {len(product_links)}')
-            page_products = get_products_from_page(wd, product_links, inner_bar)
+            page_products = get_products_from_page(wd, product_links, inner_bar, shutdown)
             product_details = pd.concat([product_details, page_products], ignore_index=True)
             dump_page_csv(page_products, category_name, page)
-            if shutdown:
+            logger.debug(f'Scrape url: {shutdown.is_set()=}')
+            if shutdown.is_set():
                 logger.info(f'Received shutdown signal on page: "{page}" of category: "{category_name}". Returning...')
                 return product_details
             
@@ -1047,14 +1067,28 @@ def thread_done_callback(thread: Future):
     else:
         logger.info("Thread completed successfully.")
 
+def get_current_iteration(folder: str, prefix = 'iteration_'):
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+        return 1
+    iterations = len([x for x in os.listdir(folder) if x.startswith(prefix)])
+    return iterations + 1
 
 if __name__ == '__main__':
-    ACTION_DELAY_SEC = 1
+
+    ROOT_DUMP_FOLDER = './excel_dumps'
+
+    DUMP_ITERATION_PREFIX = 'iteration_'
+    
+    CURRENT_ITERATION = get_current_iteration(ROOT_DUMP_FOLDER, DUMP_ITERATION_PREFIX)
+
+    ACTION_DELAY_SEC = 2
     JAVASCRIPT_EXECUTE_CLICK = "arguments[0].click();"
-    NUM_OF_WORKERS = 1
+    NUM_OF_WORKERS = 5
     MAX_RETRY_VARIATION = 5
 
-    DUMP_FOLDER = './excel_dumps'
+
+    DUMP_FOLDER = f'./{ROOT_DUMP_FOLDER}/{DUMP_ITERATION_PREFIX}{CURRENT_ITERATION}'
     CATEGORY_DUMP_FOLDER = f'{DUMP_FOLDER}/{{category}}'
     PAGE_DUMP_FOLDER = f'{CATEGORY_DUMP_FOLDER}/pages'
 
@@ -1063,7 +1097,6 @@ if __name__ == '__main__':
 
     TELEGRAM_BOT_TOKEN = '6537198249:AAHd_GKm9Bi74wTtl8khcRk2Nk9avkwxjWI'
     TELEGRAM_CHAT_IDS = ['5128147602']
-    shutdown = False
 
     browser_options = options.Options()
     browser_options.add_argument('-disable-notifications')
@@ -1082,29 +1115,42 @@ if __name__ == '__main__':
                     ]
     logger.info('Scraping started.')
     start_time = time.time()
+    shutdown = Event()
+    
+    df = pd.DataFrame()
+    executor = ThreadPoolExecutor(NUM_OF_WORKERS)
+    futures = [executor.submit(scrape_category_url, link, browser_options,shutdown) 
+                        for link in CATEGORY_LINKS]
     try:
-        df = pd.DataFrame()
-        executor = ThreadPoolExecutor(NUM_OF_WORKERS)
-        futures = [executor.submit(scrape_category_url, link) 
-                            for link in CATEGORY_LINKS]
-        for future in futures:
-            future.add_done_callback(thread_done_callback)
-        done, _ = wait(futures)
-        for done_result in done:
-            if not done_result.cancelled() and done_result.exception() is None:
-                df = pd.concat([df, done_result.result()], ignore_index=True)
+        for done_result in futures:
+            done_result.add_done_callback(thread_done_callback)
         
+        while True:
+            try:
+                if not futures:
+                    logger.info('All futures completed. Exitting...')
+                if not all((x.done()) for x in futures):
+                    continue
+                for done_result in futures:
+                    if not done_result.cancelled() and done_result.exception() is None:
+                        df = pd.concat([df, done_result.result()], ignore_index=True)
+                    futures.remove(done_result)
+                if shutdown.is_set():
+                    break
+            except KeyboardInterrupt:
+                logger.info("interrupted")
+                shutdown.set()
+
+                logger.debug("Waiting for threads to finish...")
+                executor.shutdown(cancel_futures=True)
+                
+
+                
         logger.info(f'Total data-frame shape: {df.shape}')
 
         df = cleanup_dataframe(df)
 
         logger.info("Exporting excel without duplicates...")
         df.to_csv(FINAL_DATA_FRAME_WITH_POST_CLEANUP_PATH, index=False)
-    except KeyboardInterrupt:
-        logger.info('Program interrupted by user. Aborting all queued operations...')
-        shutdown = True
-        executor.shutdown(cancel_futures=True)
-    except CancelledError:
-        logger.info('All futures cancelled successfully.')
     finally:
         logger.info('Total execution time: %s', datetime.timedelta(seconds=time.time() - start_time))
